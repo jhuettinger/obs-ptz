@@ -9,6 +9,7 @@
 #include <QObject>
 #include <QTimer>
 #include <QSerialPort>
+#include <QUdpSocket>
 #include "ptz-device.hpp"
 
 class visca_encoding {
@@ -211,6 +212,61 @@ protected:
 
 public:
 	PTZViscaSerial(OBSData config);
+
+	void set_config(OBSData ptz_data);
+	OBSData get_config();
+};
+
+/*
+ * VISCA over IP classes
+ */
+class ViscaUDPSocket : public QObject {
+	Q_OBJECT
+
+private:
+	/* Global lookup table of UART instances, used to eliminate duplicates */
+	static std::map<int, ViscaUDPSocket*> interfaces;
+
+	int visca_port;
+	QUdpSocket visca_socket;
+	int discovery_port;
+	QUdpSocket discovery_socket;
+
+signals:
+	void receive_ack(const QByteArray &packet);
+	void receive_complete(const QByteArray &packet);
+	void receive_error(const QByteArray &packet);
+	void reset();
+
+public:
+	ViscaUDPSocket(int port = 52381, int discovery_port = 51380);
+	void receive_datagram(QNetworkDatagram &datagram);
+	void send(QHostAddress ip_address, const QByteArray &packet);
+	void receive(const QByteArray &packet);
+	int port() { return visca_port; }
+
+	static ViscaUDPSocket *get_interface(int port);
+
+public slots:
+	void poll();
+	void poll_discovery();
+};
+
+class PTZViscaOverIP : public PTZVisca {
+	Q_OBJECT
+
+private:
+	int sequence;
+	QHostAddress ip_address;
+	ViscaUDPSocket *iface;
+	void attach_interface(ViscaUDPSocket *iface);
+
+protected:
+	void send_pending();
+	void reset();
+
+public:
+	PTZViscaOverIP(OBSData config);
 
 	void set_config(OBSData ptz_data);
 	OBSData get_config();

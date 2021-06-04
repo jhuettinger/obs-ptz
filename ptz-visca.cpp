@@ -5,10 +5,12 @@
  * SPDX-License-Identifier: GPLv2
  */
 
+#include <QNetworkDatagram>
 #include "ptz-visca.hpp"
 #include <util/base.h>
 
 std::map<QString, ViscaUART*> ViscaUART::interfaces;
+std::map<int, ViscaUDPSocket*> ViscaUDPSocket::interfaces;
 
 const ViscaCmd VISCA_ENUMERATE("883001ff");
 
@@ -350,5 +352,165 @@ OBSData PTZViscaSerial::get_config()
 	OBSData config = PTZDevice::get_config();
 	obs_data_set_string(config, "port", qPrintable(iface->portName()));
 	obs_data_set_int(config, "address", address);
+	return config;
+}
+
+/*
+ * VISCA over IP implementation
+ */
+ViscaUDPSocket::ViscaUDPSocket(int port, int discovery_port) :
+	visca_port(port), discovery_port(discovery_port)
+{
+	visca_socket.bind(QHostAddress::Any, visca_port);
+	discovery_socket.bind(QHostAddress::Any, discovery_port);
+	connect(&visca_socket, &QUdpSocket::readyRead, this, &ViscaUDPSocket::poll);
+	connect(&discovery_socket, &QUdpSocket::readyRead, this, &ViscaUDPSocket::poll_discovery);
+	discovery_socket.writeDatagram(QByteArray("\2ENQ:network\xff\3"), QHostAddress::Broadcast, discovery_port);
+}
+
+void ViscaUDPSocket::receive_datagram(QNetworkDatagram &dg)
+{
+	QByteArray data = dg.data();
+	int size = data[2] << 8 | data[3];
+	blog(LOG_INFO, "VISCA UDP <-- %s", qPrintable(data.toHex(':')));
+	if (data.size() == size + 8)
+		receive(data.mid(8, size));
+}
+
+void ViscaUDPSocket::send(QHostAddress ip_address, const QByteArray &packet)
+{
+	blog(LOG_INFO, "VISCA UDP --> %s", qPrintable(packet.toHex(':')));
+	visca_socket.writeDatagram(packet, ip_address, visca_port);
+}
+
+void ViscaUDPSocket::receive(const QByteArray &packet)
+{
+	blog(LOG_INFO, "VISCA <-- %s", packet.toHex(':').data());
+	if (packet.size() < 3)
+		return;
+	switch (packet[1] & 0xf0) { /* Decode response field */
+	case VISCA_RESPONSE_ACK:
+		/* Don't do anything with the ack yet */
+		blog(LOG_DEBUG, "VISCA received ACK");
+		emit receive_ack(packet);
+		break;
+	case VISCA_RESPONSE_COMPLETED:
+		blog(LOG_DEBUG, "VISCA received complete");
+		emit receive_complete(packet);
+		break;
+	case VISCA_RESPONSE_ERROR:
+		blog(LOG_DEBUG, "VISCA received error");
+		emit receive_error(packet);
+		break;
+	default:
+		blog(LOG_INFO, "VISCA received unknown");
+		/* Unknown */
+		break;
+	}
+}
+
+void ViscaUDPSocket::poll_discovery()
+{
+	while (discovery_socket.hasPendingDatagrams()) {
+		QNetworkDatagram dg = discovery_socket.receiveDatagram();
+		QByteArray data = dg.data();
+		if ((data.isEmpty()) || ((char)data.front() != 2) || ((char)data.back() != 3))
+			return;
+		auto prop_array = data.mid(1, data.size()-2).split((char)'\xff');
+		for (auto prop : prop_array) {
+			auto keyvalue = prop.split(':');
+			if (keyvalue.size() != 2)
+				continue;
+			blog(LOG_INFO, "Camera property %s = %s", qPrintable(keyvalue[0]), qPrintable(keyvalue[1]));
+		}
+	}
+}
+
+void ViscaUDPSocket::poll()
+{
+	while (visca_socket.hasPendingDatagrams())
+		receive_datagram(visca_socket.receiveDatagram());
+}
+
+ViscaUDPSocket * ViscaUDPSocket::get_interface(int port)
+{
+	ViscaUDPSocket *iface;
+	qDebug() << "Looking for Visca UDP Socket object" << port;
+	iface = interfaces[port];
+	if (!iface) {
+		qDebug() << "Creating new VISCA object" << port;
+		iface = new ViscaUDPSocket(port);
+		interfaces[port] = iface;
+	}
+	return iface;
+}
+
+PTZViscaOverIP::PTZViscaOverIP(OBSData config)
+	: PTZVisca("visca-over-ip"), iface(NULL)
+{
+	set_config(config);
+	address = 1;
+	ip_address.setAddress("192.168.16.11");
+}
+
+void PTZViscaOverIP::attach_interface(ViscaUDPSocket *new_iface)
+{
+	if (iface)
+		iface->disconnect(this);
+	iface = new_iface;
+	if (iface) {
+		connect(iface, &ViscaUDPSocket::receive_ack, this, &PTZViscaOverIP::receive_ack);
+		connect(iface, &ViscaUDPSocket::receive_complete, this, &PTZViscaOverIP::receive_complete);
+		connect(iface, &ViscaUDPSocket::reset, this, &PTZViscaOverIP::reset);
+	}
+	reset();
+}
+
+void PTZViscaOverIP::reset()
+{
+	sequence = 1;
+	iface->send(ip_address, QByteArray::fromHex("020000010000000001"));
+	send(VISCA_Clear);
+	cmd_get_camera_info();
+}
+
+void PTZViscaOverIP::send_pending()
+{
+	if (active_cmd || pending_cmds.isEmpty())
+		return;
+	active_cmd = true;
+
+	QByteArray packet = pending_cmds.first().cmd;
+	QByteArray p = QByteArray::fromHex("0100000000000000") + packet;
+	p[3] = packet.size();
+	p[4] = (sequence >> 24) & 0xff;
+	p[5] = (sequence >> 16) & 0xff;
+	p[6] = (sequence >> 8) & 0xff;
+	p[7] = sequence & 0xff;
+	p[8] = '\x81';
+	sequence++;
+
+	iface->send(ip_address, p);
+	timeout_timer.setSingleShot(true);
+	timeout_timer.start(1000);
+}
+
+void PTZViscaOverIP::set_config(OBSData config)
+{
+	PTZDevice::set_config(config);
+	const char *ip = obs_data_get_string(config, "address");
+	if (ip)
+		ip_address = QHostAddress(ip);
+	int port = obs_data_get_int(config, "port");
+	if (!port)
+		port = 52381;
+	attach_interface(ViscaUDPSocket::get_interface(port));
+}
+
+OBSData PTZViscaOverIP::get_config()
+{
+	OBSData config = PTZDevice::get_config();
+	obs_data_set_string(config, "address", qPrintable(ip_address.toString()));
+	obs_data_set_int(config, "port", iface->port());
 	return config;
 }

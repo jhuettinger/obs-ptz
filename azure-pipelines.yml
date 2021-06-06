@@ -55,15 +55,15 @@ jobs:
         build_config: $(build_config)
         DepsPath32: $(DepsPath32)
         DepsPath64: $(DepsPath64)
-        QTDIR32: $(QTDIR32)
+        QTDIR32: $(QTDIR32) 
         QTDIR64: $(QTDIR64)
         OBSPath: $(OBSPath)
         isAzure: $(isAzure)
-    - task: MSBuild@1
-      displayName: 'Build OBS Studio 32-bit'
-      inputs:
-        msbuildArguments: '/m /p:Configuration=$(build_config)'
-        solution: '$(OBSPath)\build32\obs-studio.sln'
+#    - task: MSBuild@1
+#      displayName: 'Build OBS Studio 32-bit'
+#      inputs:
+#        msbuildArguments: '/m /p:Configuration=$(build_config)'
+#        solution: '$(OBSPath)\build32\obs-studio.sln'
     - task: MSBuild@1
       displayName: 'Build OBS Studio 64-bit'
       inputs:
@@ -77,11 +77,11 @@ jobs:
         QTDIR64: $(QTDIR64)
         OBSPath: $(OBSPath)
         isAzure: $(isAzure)
-    - task: MSBuild@1
-      displayName: 'Build obs-ptz 32-bit'
-      inputs:
-        msbuildArguments: '/m /p:Configuration=$(build_config)'
-        solution: '.\build32\obs-ptz.sln'
+#    - task: MSBuild@1
+#      displayName: 'Build obs-ptz 32-bit'
+#      inputs:
+#        msbuildArguments: '/m /p:Configuration=$(build_config)'
+#        solution: '.\build32\obs-ptz.sln'
     - task: MSBuild@1
       displayName: 'Build obs-midi 64-bit'
       inputs:
